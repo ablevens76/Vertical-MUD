@@ -1,0 +1,5 @@
+{
+  "name": "Vertical MUD: The Descent",
+  "description": "A high-speed, text-based RPG where you descend into a procedurally generated dungeon, battle enemies in tick-based combat, and sprint back to the surface before the shaft collapses.",
+  "requestFramePermissions": []
+}
