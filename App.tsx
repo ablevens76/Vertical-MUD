@@ -1,11 +1,14 @@
+
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { GoogleGenAI } from "@google/genai";
 import { Player, Room, Mob, LogEntry, Item, GamePhase, ClassType } from './types';
 import { generateRoom } from './utils/gameGenerator';
 import { MAX_TIME_SECONDS, BASE_ITEMS } from './constants';
 import StatsPanel from './components/StatsPanel';
 import RoomPanel from './components/RoomPanel';
 import LogPanel from './components/LogPanel';
-import { Timer, Skull, ArrowUp } from 'lucide-react';
+import MapPanel from './components/MapPanel';
+import { Timer, Skull, ArrowUp, Map as MapIcon, FileText } from 'lucide-react';
 
 const INITIAL_PLAYER: Player = {
   name: "Drifter",
@@ -35,7 +38,9 @@ const App: React.FC = () => {
   // Game State
   const [phase, setPhase] = useState<GamePhase>(GamePhase.START);
   const [timeLeft, setTimeLeft] = useState(MAX_TIME_SECONDS);
-  const [depth, setDepth] = useState(0);
+  
+  // Coordinates instead of just depth
+  const [coords, setCoords] = useState({ x: 0, y: 0, z: 0 });
   const [rooms, setRooms] = useState<Map<string, Room>>(new Map());
   const [currentRoomId, setCurrentRoomId] = useState<string>('');
   
@@ -46,7 +51,11 @@ const App: React.FC = () => {
   
   // UI
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [activeTab, setActiveTab] = useState<'log' | 'map'>('log');
   const logCounter = useRef(0);
+
+  // --- Gemini GenAI Setup ---
+  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
   // --- Helper: Logging ---
   const addLog = useCallback((text: string, type: LogEntry['type'] = 'info') => {
@@ -55,6 +64,103 @@ const App: React.FC = () => {
       return [...prev.slice(-49), newLog];
     });
   }, []);
+
+  // --- AI Storyteller ---
+  const generateStory = useCallback(async (prompt: string, context: string = '') => {
+      try {
+          // Use flash-lite for low-latency narrative generation
+          const response = await ai.models.generateContent({
+              model: 'gemini-2.5-flash-lite',
+              contents: `System: You are the Dungeon Master for a dark fantasy roguelike game. Keep outputs brief (1-2 sentences), evocative, and gritty. Second person perspective ("You...").
+              Context: ${context}
+              Task: ${prompt}`,
+          });
+          
+          const text = response.text;
+          if (text) {
+              addLog(text.trim(), 'story');
+          }
+      } catch (error) {
+          console.error("Story generation failed", error);
+      }
+  }, [addLog, ai.models]);
+
+  const generateMobVisuals = async (mob: Mob, roomDescription: string, isDead: boolean) => {
+    // RESTRICTION: Only generate images for Bosses
+    if (mob.type !== 'boss') return;
+
+    // Prevent double generation
+    if (!isDead && (mob.imageUrl || mob.isGenerating)) return;
+    if (isDead && (mob.deadImageUrl || mob.isGenerating)) return;
+
+    // Set generating flag locally
+    setRooms(prev => {
+        const r = prev.get(currentRoomId);
+        if (!r) return prev;
+        const newMobs = r.mobs.map(m => m.id === mob.id ? { ...m, isGenerating: true } : m);
+        return new Map(prev).set(currentRoomId, { ...r, mobs: newMobs });
+    });
+
+    try {
+        const prompt = isDead 
+            ? `A defeated ${mob.name} lying dead on the floor of a ${roomDescription}. Dark, gritty fantasy art, looting aftermath, gloomy atmosphere.`
+            : `A menacing, low-angle digital painting of a ${mob.name} inside a ${roomDescription}. Dark fantasy RPG style, cinematic lighting, detailed, 4k.`;
+
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash-image',
+            contents: { parts: [{ text: prompt }] }
+        });
+
+        let imageUrl = "";
+        for (const part of response.candidates?.[0]?.content?.parts || []) {
+            if (part.inlineData) {
+                imageUrl = `data:image/png;base64,${part.inlineData.data}`;
+                break;
+            }
+        }
+
+        if (imageUrl) {
+            setRooms(prev => {
+                const r = prev.get(currentRoomId);
+                if (!r) return prev;
+                const newMobs = r.mobs.map(m => {
+                    if (m.id !== mob.id) return m;
+                    return {
+                        ...m,
+                        isGenerating: false,
+                        imageUrl: !isDead ? imageUrl : m.imageUrl,
+                        deadImageUrl: isDead ? imageUrl : m.deadImageUrl
+                    };
+                });
+                const newMap = new Map(prev);
+                newMap.set(currentRoomId, { ...r, mobs: newMobs });
+                return newMap;
+            });
+            
+            // If this is our current target, update the target reference too so the UI refreshes
+            setTarget(curr => {
+                if (curr && curr.id === mob.id) {
+                    return {
+                        ...curr,
+                        isGenerating: false,
+                        imageUrl: !isDead ? imageUrl : curr.imageUrl,
+                        deadImageUrl: isDead ? imageUrl : curr.deadImageUrl
+                    }
+                }
+                return curr;
+            });
+        }
+    } catch (error) {
+        console.error("Failed to generate mob image:", error);
+        // Reset generating flag
+        setRooms(prev => {
+            const r = prev.get(currentRoomId);
+            if (!r) return prev;
+            const newMobs = r.mobs.map(m => m.id === mob.id ? { ...m, isGenerating: false } : m);
+            return new Map(prev).set(currentRoomId, { ...r, mobs: newMobs });
+        });
+    }
+  };
 
   // --- Helper: Stat Calculation ---
   const getPlayerStats = useCallback(() => {
@@ -108,7 +214,8 @@ const App: React.FC = () => {
 
       // 3. Regen (Slowly out of combat)
       setTarget(currTarget => {
-        if (!currTarget) {
+        // If no target OR target is dead, regen
+        if (!currTarget || currTarget.isDead) {
              setPlayer(p => ({
                  ...p,
                  hp: Math.min(p.maxHp, p.hp + 0.5),
@@ -129,7 +236,10 @@ const App: React.FC = () => {
                  if (newMobHp <= 0) {
                      // Mob Death Logic
                      handleMobDeath(currTarget);
-                     return null;
+                     // Return null or modified dead mob? 
+                     // We want to show the dead body, so we return the dead mob but stop combat loop logic 
+                     // because next tick !currTarget || currTarget.isDead will be true.
+                     return { ...currTarget, hp: 0, isDead: true };
                  } else {
                      // Update Mob HP locally within the state setter
                      // We need to update the mob inside the room state too
@@ -178,6 +288,9 @@ const App: React.FC = () => {
   const handleMobDeath = (mob: Mob) => {
     addLog(`You killed ${mob.name}! (+${mob.xpValue} XP)`, 'gain');
     
+    // Story Event: Death
+    generateStory(`Describe the brutal death of a ${mob.name}.`, `Room: ${rooms.get(currentRoomId)?.name}`);
+
     // XP & Level Up
     setPlayer(p => {
         let newXp = p.xp + mob.xpValue;
@@ -207,95 +320,110 @@ const App: React.FC = () => {
         };
     });
 
-    // Loot Drop
+    // Loot Drop & Corpse Management
+    const room = rooms.get(currentRoomId);
     if (mob.loot.length > 0) {
         addLog(`${mob.name} dropped: ${mob.loot.map(i => i.name).join(', ')}`, 'loot');
-        setRooms(prev => {
-            const r = prev.get(currentRoomId);
-            if (!r) return prev;
-            const newMap = new Map(prev);
-            newMap.set(currentRoomId, {
-                ...r,
-                mobs: r.mobs.filter(m => m.id !== mob.id),
-                items: [...r.items, ...mob.loot]
-            });
-            return newMap;
-        });
-    } else {
-        setRooms(prev => {
-            const r = prev.get(currentRoomId);
-            if (!r) return prev;
-            const newMap = new Map(prev);
-            newMap.set(currentRoomId, { ...r, mobs: r.mobs.filter(m => m.id !== mob.id) });
-            return newMap;
-        });
     }
     
-    setTarget(null);
+    // Trigger Dead Image Gen (Only for Bosses)
+    generateMobVisuals(mob, room ? room.name : "dungeon", true);
+
+    setRooms(prev => {
+        const r = prev.get(currentRoomId);
+        if (!r) return prev;
+        const newMap = new Map(prev);
+        
+        // Mark mob as dead, remove loot from mob
+        const newMobs = r.mobs.map(m => m.id === mob.id ? { ...m, isDead: true, hp: 0, loot: [] } : m);
+        
+        // Add loot to room floor
+        const newItems = [...r.items, ...mob.loot];
+        
+        newMap.set(currentRoomId, {
+            ...r,
+            mobs: newMobs,
+            items: newItems
+        });
+        return newMap;
+    });
+
+    setTarget(t => t ? { ...t, isDead: true, hp: 0 } : null);
   };
 
   // --- Actions ---
 
   const startGame = () => {
-    const startRoom = generateRoom(0, 'start');
+    // Generate Room at 0, 0, 0
+    const startRoom = generateRoom(0, 0, 0);
     startRoom.name = "The Surface Entrance";
     startRoom.description = "You stand at the edge of the Infinite Shaft. The wind howls upwards. There is no turning back, only down.";
     startRoom.mobs = [];
+    startRoom.exits.up = false; // Cannot ascend from surface
     
     const newRooms = new Map();
     newRooms.set(startRoom.id, startRoom);
     
     setRooms(newRooms);
+    setCoords({ x: 0, y: 0, z: 0 });
     setCurrentRoomId(startRoom.id);
     setPhase(GamePhase.PLAYING);
     setLogs([]);
     setTimeLeft(MAX_TIME_SECONDS);
     setPlayer(INITIAL_PLAYER);
     addLog("The descent begins. Good luck, Drifter.", 'info');
+    generateStory("Describe the ominous beginning of a descent into an infinite abyss.");
   };
 
-  const handleMove = (dir: 'up' | 'down') => {
-    if (player.move < 5) {
+  const handleMove = (dir: 'up' | 'down' | 'north' | 'south' | 'east' | 'west') => {
+    if (player.move < 2) {
         addLog("Too exhausted to move!", 'info');
         return;
     }
 
-    const nextDepth = dir === 'down' ? depth + 1 : depth - 1;
+    let { x, y, z } = coords;
+
+    if (dir === 'up') z--;
+    if (dir === 'down') z++;
+    if (dir === 'north') y++;
+    if (dir === 'south') y--;
+    if (dir === 'east') x++;
+    if (dir === 'west') x--;
     
-    if (nextDepth < 0 && depth === 0) {
-        // Trying to go up from surface
-        addLog("You need to go deeper first...", 'info');
-        return; 
-    }
-    
-    // Victory Condition: Return to surface after reaching at least depth 10
-    if (nextDepth < 0) {
-        // Check if we did enough? For now, let's just say you win if you survive 5 mins or went deep.
-        // Simplified: Returning to surface wins.
+    if (z < 0) {
         setPhase(GamePhase.VICTORY);
         return;
     }
 
-    // Generate Key for next room (simple coordinate system for this vertical line)
-    // Actually, since we want persistent rooms on the way up, we need to store them.
-    // Let's use depth as part of ID, but we might have branches later.
-    // For this sprint: linear list.
-    
-    // We need to find the ID of the room at nextDepth. 
-    // In this simple model, let's assume one room per depth level for simplicity of the "Shaft"
-    // ID = "depth-X".
-    const nextRoomId = `depth-${nextDepth}`;
+    const nextRoomId = `room_${x}_${y}_${z}`;
     let nextRoom = rooms.get(nextRoomId);
+    let isNewRoom = false;
 
     if (!nextRoom) {
-        nextRoom = generateRoom(nextDepth, nextRoomId);
+        nextRoom = generateRoom(x, y, z);
         setRooms(prev => new Map(prev).set(nextRoomId, nextRoom!));
+        isNewRoom = true;
     }
 
     setCurrentRoomId(nextRoomId);
-    setDepth(nextDepth);
-    setPlayer(p => ({ ...p, move: p.move - 5 }));
-    addLog(`You move ${dir} to Depth ${nextDepth}.`, 'info');
+    setCoords({ x, y, z });
+    setPlayer(p => ({ ...p, move: p.move - 2 }));
+    setTarget(null); // Clear target when moving
+    addLog(`You move ${dir} to ${x},${y} (Depth ${z}).`, 'info');
+
+    // "Pre-Make" Images: Check if there is a Boss in the room and start generating immediately
+    const boss = nextRoom.mobs.find(m => m.type === 'boss' && !m.isDead);
+    if (boss && !boss.imageUrl) {
+        addLog("A presence sends shivers down your spine...", 'danger');
+        generateMobVisuals(boss, nextRoom.name, false);
+    }
+
+    // Story Event: Movement
+    if (isNewRoom) {
+        generateStory(`Describe entering a new room: ${nextRoom.name}. It appears to be a ${nextRoom.description}`, `Depth: ${z}`);
+    } else {
+        generateStory(`Describe returning to ${nextRoom.name}.`, `Depth: ${z}`);
+    }
   };
 
   const handleRest = () => {
@@ -308,11 +436,27 @@ const App: React.FC = () => {
       }));
       // Resting costs time
       setTimeLeft(t => t - 10);
+      generateStory("Describe a brief, uneasy moment of rest in the darkness.");
   };
 
   const handleAttack = (mob: Mob) => {
+      if (mob.isDead) {
+          setTarget(mob); // Select corpse for viewing
+          addLog(`You inspect the corpse of ${mob.name}.`, 'info');
+          return;
+      }
+      
+      const isNewTarget = target?.id !== mob.id;
       setTarget(mob);
       addLog(`You engage the ${mob.name}!`, 'combat');
+      
+      // Attempt image gen (will only run if Boss due to new restriction)
+      const room = rooms.get(currentRoomId);
+      generateMobVisuals(mob, room ? room.name : "dungeon", false);
+
+      if (isNewTarget) {
+          generateStory(`Describe a hostile ${mob.name} noticing the player and preparing to attack.`, `Room: ${room?.name}`);
+      }
   };
 
   const handleFlee = () => {
@@ -331,7 +475,7 @@ const App: React.FC = () => {
   };
 
   const handleSkill = (skill: string) => {
-    if (!target) return;
+    if (!target || target.isDead) return;
     
     if (skill === 'bash') {
         const dmg = Math.floor(getPlayerStats().str * 1.5);
@@ -410,10 +554,26 @@ const App: React.FC = () => {
   };
 
   const handleUse = (item: Item) => {
+      if (item.statUpgrade) {
+          setPlayer(p => ({
+              ...p,
+              str: p.str + (item.statUpgrade?.str || 0),
+              dex: p.dex + (item.statUpgrade?.dex || 0),
+              int: p.int + (item.statUpgrade?.int || 0),
+              inventory: p.inventory.filter(i => i.id !== item.id)
+          }));
+          addLog(`You used ${item.name} and grew stronger!`, 'gain');
+          return;
+      }
       if (item.name === 'Potion of Healing') {
           setPlayer(p => ({...p, hp: Math.min(p.maxHp, p.hp + 25), inventory: p.inventory.filter(i => i.id !== item.id)}));
           addLog("You drank the potion and feel refreshed.", 'gain');
       }
+  };
+  
+  const handleUserChat = (message: string) => {
+      addLog(`You: ${message}`, 'info');
+      generateStory(`The player asks/says: "${message}". React to this as the Dungeon Master.`, `Current Room: ${rooms.get(currentRoomId)?.name}`);
   };
 
   // --- Render ---
@@ -427,11 +587,11 @@ const App: React.FC = () => {
                   <div className="text-sm text-slate-500 mb-8 border p-4 border-slate-800 text-left">
                       <p>INSTRUCTIONS:</p>
                       <ul className="list-disc pl-5 space-y-1 mt-2">
-                          <li>Click [DESCEND] to go deeper. Mobs get harder.</li>
-                          <li>Click Mobs to engage Combat.</li>
+                          <li>Use the GRID to explore side rooms for Elite loot.</li>
+                          <li>Click [DESCEND] (at 0,0) to go deeper. Mobs get harder.</li>
+                          <li>Every 10 Levels: BOSS GUARDIAN.</li>
                           <li>Combat is AUTO-TICK based. Use skills to burst.</li>
                           <li>Watch your STAMINA (Yellow Bar). Fleeing costs Stamina.</li>
-                          <li>You must return to Depth 0 to survive.</li>
                       </ul>
                   </div>
                   <button onClick={startGame} className="px-8 py-3 bg-emerald-900 hover:bg-emerald-800 text-white font-bold rounded text-xl transition-all hover:scale-105">ENTER THE SHAFT</button>
@@ -446,7 +606,7 @@ const App: React.FC = () => {
              <div className="text-center">
                  <Skull size={64} className="mx-auto mb-4 animate-bounce" />
                  <h1 className="text-6xl font-bold mb-4">YOU DIED</h1>
-                 <p className="text-xl text-red-300">Depth Reached: {depth}</p>
+                 <p className="text-xl text-red-300">Depth Reached: {coords.z}</p>
                  <button onClick={() => setPhase(GamePhase.START)} className="mt-8 px-6 py-2 border border-red-500 hover:bg-red-900 transition-colors">TRY AGAIN</button>
              </div>
         </div>
@@ -473,13 +633,13 @@ const App: React.FC = () => {
     <div className="h-screen w-screen bg-black text-slate-200 flex flex-col p-2 overflow-hidden">
         {/* Header */}
         <header className="h-12 flex items-center justify-between px-4 bg-slate-900 border-b border-emerald-900/50 shrink-0">
-            <div className="font-bold text-emerald-500 tracking-widest">VERTICAL MUD <span className="text-xs text-slate-600 ml-2">VER 0.9</span></div>
+            <div className="font-bold text-emerald-500 tracking-widest">VERTICAL MUD <span className="text-xs text-slate-600 ml-2">VER 1.0</span></div>
             <div className="flex gap-6 font-mono text-sm font-bold">
                 <div className={`flex items-center gap-2 ${timeLeft < 300 ? 'text-red-500 animate-pulse-fast' : 'text-slate-300'}`}>
                     <Timer size={16} /> 
                     {Math.floor(timeLeft / 60)}:{String(timeLeft % 60).padStart(2, '0')}
                 </div>
-                <div className="text-blue-400">DEPTH: {depth}</div>
+                <div className="text-blue-400">POS: {coords.x}, {coords.y}, {coords.z}</div>
             </div>
         </header>
 
@@ -513,9 +673,32 @@ const App: React.FC = () => {
                 )}
             </div>
 
-            {/* Right: Logs */}
-            <div className="md:col-span-3 min-h-0">
-                <LogPanel logs={logs} />
+            {/* Right: Logs & Map */}
+            <div className="md:col-span-3 min-h-0 flex flex-col">
+                {/* Tabs */}
+                <div className="flex bg-slate-900 border border-slate-700 rounded-t-md shrink-0">
+                    <button 
+                        onClick={() => setActiveTab('log')}
+                        className={`flex-1 py-2 text-xs font-bold uppercase flex items-center justify-center gap-2 ${activeTab === 'log' ? 'bg-slate-800 text-white border-b-2 border-emerald-500' : 'text-slate-500 hover:bg-slate-800/50'}`}
+                    >
+                        <FileText size={14}/> Logs
+                    </button>
+                    <button 
+                         onClick={() => setActiveTab('map')}
+                         className={`flex-1 py-2 text-xs font-bold uppercase flex items-center justify-center gap-2 ${activeTab === 'map' ? 'bg-slate-800 text-white border-b-2 border-emerald-500' : 'text-slate-500 hover:bg-slate-800/50'}`}
+                    >
+                        <MapIcon size={14}/> 3D Map
+                    </button>
+                </div>
+
+                {/* Content */}
+                <div className="flex-1 min-h-0 border-x border-b border-slate-700 bg-slate-900 rounded-b-md overflow-hidden relative">
+                    {activeTab === 'log' ? (
+                        <LogPanel logs={logs} onUserChat={handleUserChat} />
+                    ) : (
+                        <MapPanel rooms={rooms} currentRoomId={currentRoomId} player={player} />
+                    )}
+                </div>
             </div>
         </main>
     </div>

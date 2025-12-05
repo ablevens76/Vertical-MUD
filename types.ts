@@ -1,3 +1,4 @@
+
 export enum ClassType {
   WARRIOR = 'Warrior',
   MAGE = 'Mage',
@@ -51,6 +52,15 @@ export interface Mob {
   isAggro: boolean;
   type: 'beast' | 'humanoid' | 'undead' | 'boss';
   loot: Item[];
+  
+  // Elite Status
+  isElite?: boolean;
+
+  // Visuals & State
+  isDead: boolean;
+  imageUrl?: string;
+  deadImageUrl?: string;
+  isGenerating?: boolean;
 }
 
 export interface Item {
@@ -65,13 +75,21 @@ export interface Item {
     armor?: number;
     damage?: number;
   };
+  statUpgrade?: {
+    str?: number;
+    int?: number;
+    dex?: number;
+    hp?: number;
+    mana?: number;
+  };
   value: number;
   description: string;
 }
 
 export interface Room {
   id: string;
-  depth: number;
+  depth: number; // Kept for ease of access, equals z
+  coordinates: { x: number; y: number; z: number };
   name: string;
   description: string;
   mobs: Mob[];
@@ -79,6 +97,10 @@ export interface Room {
   exits: {
     up: boolean;
     down: boolean;
+    north: boolean;
+    south: boolean;
+    east: boolean;
+    west: boolean;
   };
   visited: boolean;
 }
@@ -86,7 +108,7 @@ export interface Room {
 export interface LogEntry {
   id: string;
   text: string;
-  type: 'combat' | 'info' | 'loot' | 'danger' | 'gain';
+  type: 'combat' | 'info' | 'loot' | 'danger' | 'gain' | 'story';
   timestamp: number;
 }
 
